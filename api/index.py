@@ -1,5 +1,4 @@
 import os
-import random
 import aiohttp
 import asyncio
 from fastapi import FastAPI, Request
@@ -12,100 +11,75 @@ app = FastAPI()
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# Ссылка на мониторинг всех серверов Cobalt
-INSTANCES_API = "https://instances.hyper.lol/api/instances.json"
-
-async def get_working_instance():
-    """
-    Получает список живых серверов динамически.
-    """
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(INSTANCES_API, timeout=5) as response:
-                if response.status != 200:
-                    return None
-                
-                data = await response.json()
-                valid_instances = []
-                
-                for instance in data:
-                    # Фильтруем серверы:
-                    # 1. score == 1 (100% здоровье)
-                    # 2. cors == 1 (разрешает запросы с чужих сайтов/ботов)
-                    # 3. version >= 10 (поддерживает новый API)
-                    # 4. Исключаем официальный, так как там капча (turnstile)
-                    if (instance.get('score', 0) >= 0.9 and 
-                        instance.get('cors', 0) == 1 and 
-                        instance.get('version', '0').startswith('10') and
-                        "cobalt.tools" not in instance.get('url', '')):
-                        
-                        # Убираем слеш в конце, если есть
-                        url = instance.get('url').rstrip('/')
-                        # Проверяем протокол
-                        if url.startswith("https"):
-                            valid_instances.append(url)
-                
-                if valid_instances:
-                    # Берем случайный из рабочих, чтобы распределять нагрузку
-                    return random.choice(valid_instances)
-                    
-        except Exception as e:
-            print(f"Ошибка получения списка серверов: {e}")
-            
-    # ЗАПАСНОЙ ВАРИАНТ (Если мониторинг не отвечает, пробуем эти хардкодом)
-    return "https://cobalt.kwiatekmiki.pl" 
+# --- СПИСОК ВЫЖИВШИХ (Hardcoded List) ---
+# Это серверы, которые работают прямо сейчас, в обход мониторингов.
+# Мы будем пробовать их по очереди.
+COBALT_INSTANCES = [
+    "https://api.notsobad.app",       # Часто живой
+    "https://cobalt.smartcode.nl",    # Европейское зеркало
+    "https://cobalt.q-s.pl",          # Польское зеркало
+    "https://cobalt.rudart.cn",       # Китайское зеркало (иногда медленное, но рабочее)
+    "https://api.cool.bio",           # Альтернатива
+]
 
 async def get_download_url(url: str):
-    # 1. Ищем рабочий сервер
-    base_url = await get_working_instance()
-    
-    if not base_url:
-        return {"success": False, "error": "Не удалось найти живой сервер Cobalt."}
-
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": "https://cobalt.tools",
+        "Referer": "https://cobalt.tools/"
     }
     
     body = {
         "url": url,
-        "vCodec": "h264",
+        "vCodec": "h264"
     }
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Запрос к найденному серверу
-            async with session.post(base_url, json=body, headers=headers, timeout=9) as response:
-                
-                if response.status != 200:
-                    text = await response.text()
-                    return {"success": False, "error": f"Сервер {base_url} вернул ошибку: {response.status}"}
+    last_error = ""
 
-                data = await response.json()
+    async with aiohttp.ClientSession() as session:
+        # Перебираем список вручную
+        for base_url in COBALT_INSTANCES:
+            try:
+                # Формируем URL. Убираем слеш на конце, если есть
+                target_url = base_url.rstrip("/")
                 
-                link = None
-                status = data.get('status')
+                # Ставим короткий таймаут (5 сек), чтобы быстро перескакивать мертвые
+                async with session.post(target_url, json=body, headers=headers, timeout=5) as response:
+                    
+                    if response.status != 200:
+                        # Если сервер вернул ошибку, просто идем к следующему
+                        last_error += f"\n❌ {base_url}: HTTP {response.status}"
+                        continue
+
+                    data = await response.json()
+                    
+                    # Пытаемся достать ссылку
+                    link = None
+                    status = data.get('status')
+                    
+                    if status == 'stream' or status == 'redirect':
+                        link = data.get('url')
+                    elif status == 'picker':
+                        picker = data.get('picker')
+                        if picker: link = picker[0].get('url')
+                    
+                    if link:
+                        return {"success": True, "url": link}
+            
+            except Exception as e:
+                # Если сервер вообще не отвечает (DNS error), идем дальше
+                last_error += f"\n☠️ {base_url}: Error"
+                continue
                 
-                if status == 'stream' or status == 'redirect':
-                    link = data.get('url')
-                elif status == 'picker':
-                    picker = data.get('picker')
-                    if picker: link = picker[0].get('url')
-                
-                if link:
-                    return {"success": True, "url": link}
-                else:
-                    return {"success": False, "error": f"Сервер ответил, но ссылки нет. Статус: {status}"}
-        
-        except Exception as e:
-            return {"success": False, "error": f"Ошибка соединения с {base_url}: {str(e)}"}
+    return {"success": False, "error": last_error}
 
 # --- ХЕНДЛЕРЫ ---
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("Я использую динамический поиск серверов. Кидай ссылку!")
+    await message.answer("Режим выживания активирован. Кидай ссылку!")
 
 @dp.message()
 async def download_handler(message: types.Message):
@@ -114,7 +88,7 @@ async def download_handler(message: types.Message):
         await message.answer("Это не ссылка.")
         return
 
-    status_msg = await message.answer("📡 Ищу рабочий сервер и качаю...")
+    status_msg = await message.answer("🔄 Перебираю рабочие зеркала...")
     
     result = await get_download_url(text)
     
@@ -127,9 +101,10 @@ async def download_handler(message: types.Message):
             )
             await status_msg.delete()
         except Exception as e:
-             await status_msg.edit_text(f"📹 Ссылка найдена, но Телеграм не загрузил видео (возможно, слишком большое).\n\n🔗 {result['url']}")
+             await status_msg.edit_text(f"📹 Ссылка найдена, но загрузка не удалась.\n{result['url']}")
     else:
-        await status_msg.edit_text(f"🛑 Ошибка:\n{result['error']}")
+        # Если все 5 серверов лежат
+        await status_msg.edit_text(f"🛑 Все зеркала недоступны.\nБесплатные API сейчас штормит.\n{result['error']}")
 
 # --- WEBHOOK ---
 
@@ -144,4 +119,4 @@ async def webhook_handler(request: Request):
 
 @app.get("/")
 async def index():
-    return {"message": "Auto-healing bot running"}
+    return {"message": "Survival mode active"}
