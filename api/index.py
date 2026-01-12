@@ -10,26 +10,30 @@ app = FastAPI()
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# --- СПИСОК СЕРВЕРОВ (Обновлен под Cobalt v10) ---
-# Обрати внимание: в конце ссылок НЕТ "/api/json"
+# --- СПИСОК ЖИВЫХ СЕРВЕРОВ (Январь 2025) ---
+# Если какие-то умрут, бот автоматически перейдет к следующему.
 COBALT_INSTANCES = [
-    "https://api.cobalt.tools",          # Официальный API
-    "https://cobalt.kwiatekmiki.pl",     # Стабильное зеркало
-    "https://cobalt.jojo.biz.id",        # Зеркало 2
-    "https://cobalt.timos.design",       # Зеркало 3
+    "https://api.notsobad.app",      # Очень стабильный
+    "https://cobalt.pub",            # Популярное зеркало
+    "https://cobalt.moskas.io",      # Надежный
+    "https://api.cobalt.tools",      # Официальный (часто капризный)
+    "https://cobalt.frontend.ju.mp"  # Запасной
 ]
 
 async def get_download_url(url: str):
+    # Заголовки, максимально похожие на настоящий браузер
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": "https://cobalt.tools",
+        "Referer": "https://cobalt.tools/"
     }
     
     body = {
         "url": url,
-        "vCodec": "h264",
-        "filenamePattern": "basic" # Нужно для v10
+        "vCodec": "h264", 
+        # vCodec h264 обязателен, иначе Телеграм не поймет видео
     }
 
     last_error = ""
@@ -37,47 +41,40 @@ async def get_download_url(url: str):
     async with aiohttp.ClientSession() as session:
         for base_url in COBALT_INSTANCES:
             try:
-                # В новой версии API (v10) мы шлем запрос прямо в корень "/"
-                # или добавляем "/api/json" только для старых версий.
-                # Большинство серверов сейчас перешли на v10, поэтому пробуем корень.
+                # В Cobalt v10+ запрос шлется методом POST прямо в корень "/"
+                # Убираем слеш в конце base_url если он есть, чтобы не было двойного
+                api_url = base_url.rstrip("/")
                 
-                # Попробуем сформировать корректный URL
-                # Некоторые инстансы требуют / на конце, некоторые нет.
-                request_url = base_url if base_url.endswith("/") else f"{base_url}/"
-                
-                # ВАЖНО: для v7 было /api/json, для v10 просто POST на корень
-                # Но на всякий случай обработаем гибридный вариант
-                
-                async with session.post(request_url, json=body, headers=headers, timeout=9) as response:
+                # Ставим таймаут 7 секунд
+                async with session.post(api_url, json=body, headers=headers, timeout=7) as response:
                     
                     if response.status != 200:
-                        # Если корень не сработал, попробуем старый путь (для совместимости)
-                        if response.status == 404:
-                            # Логика повтора для старого API опущена для краткости, 
-                            # так как мы используем свежие серверы.
-                            pass
-                            
                         err_text = await response.text()
-                        last_error += f"\n❌ {base_url}: {response.status}"
+                        # Сокращаем текст ошибки для логов
+                        last_error += f"\n❌ {base_url}: HTTP {response.status}"
                         continue
 
                     data = await response.json()
                     
-                    # Логика парсинга ответа (она похожа)
+                    # Пытаемся достать ссылку
                     link = None
-                    if data.get('status') == 'stream': link = data.get('url')
-                    elif data.get('status') == 'redirect': link = data.get('url')
-                    elif data.get('status') == 'picker': link = data.get('picker')[0].get('url')
-                    # В v10 иногда ссылка лежит прямо в корне json, если успех? 
-                    # Нет, структура 'status' сохраняется.
+                    status = data.get('status')
+                    
+                    if status == 'stream' or status == 'redirect':
+                        link = data.get('url')
+                    elif status == 'picker':
+                        # Если видео состоит из нескольких вариантов, берем первый
+                        picker = data.get('picker')
+                        if picker and len(picker) > 0:
+                            link = picker[0].get('url')
                     
                     if link:
                         return {"success": True, "url": link}
                     else:
-                        last_error += f"\n⚠️ {base_url}: Ответ OK, но ссылки нет."
+                        last_error += f"\n⚠️ {base_url}: JSON OK, ссылки нет."
             
             except Exception as e:
-                last_error += f"\n☠️ {base_url}: {str(e)}"
+                last_error += f"\n☠️ {base_url}: {str(e)[:50]}" # Обрезаем длинные ошибки
                 
     return {"success": False, "error": last_error}
 
@@ -85,7 +82,7 @@ async def get_download_url(url: str):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("Версия бота: Cobalt v10.\nКидай ссылку на TikTok/Reels!")
+    await message.answer("Привет! Я готов качать видео. Кидай ссылку!")
 
 @dp.message()
 async def download_handler(message: types.Message):
@@ -94,22 +91,24 @@ async def download_handler(message: types.Message):
         await message.answer("Это не ссылка.")
         return
 
-    status_msg = await message.answer("🔎 Ищу видео (v10)...")
+    status_msg = await message.answer("🔎 Перебираю серверы...")
     
     result = await get_download_url(text)
     
     if result["success"]:
         try:
+            # Сначала пробуем отправить как видео
             await message.answer_video(
                 video=result["url"],
-                caption="✅ Готово!",
+                caption="✅ Видео скачано!",
                 reply_to_message_id=message.message_id
             )
             await status_msg.delete()
         except Exception as e:
-             await status_msg.edit_text(f"✅ Ссылка есть, но Телеграм не скачал: {e}")
+             # Если видео слишком большое или формат странный, кидаем просто ссылку
+             await status_msg.edit_text(f"📹 Видео найдено, но Телеграм не может его загрузить сам.\nВот прямая ссылка:\n{result['url']}")
     else:
-        await status_msg.edit_text(f"🛑 <b>Ошибка скачивания:</b>\n{result['error']}", parse_mode="HTML")
+        await status_msg.edit_text(f"🛑 <b>Не удалось скачать:</b>\n{result['error']}", parse_mode="HTML")
 
 # --- WEBHOOK ---
 
@@ -124,4 +123,4 @@ async def webhook_handler(request: Request):
 
 @app.get("/")
 async def index():
-    return {"message": "Bot is running v10"}
+    return {"message": "Bot is active"}
