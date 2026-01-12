@@ -1,86 +1,93 @@
 import os
 import aiohttp
+import asyncio
 from fastapi import FastAPI, Request
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import Update
 
 # --- НАСТРОЙКИ ---
-# Токен берется из Environment Variables в Vercel
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Инициализация
 app = FastAPI()
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ (COBALT API) ---
+# --- СПИСОК СЕРВЕРОВ ---
+# Мы будем пробовать их по очереди.
+# Список взят из https://instances.hyper.lol/
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools/api/json",      # Официальный (часто перегружен)
+    "https://co.wuk.sh/api/json",             # Популярный
+    "https://cobalt.xyzen.dev/api/json",      # Альтернатива 1
+    "https://api.server.social/api/json",     # Альтернатива 2
+    "https://cobalt.razex.app/api/json",      # Альтернатива 3
+]
+
+# --- НОВАЯ ФУНКЦИЯ (С ПЕРЕБОРОМ СЕРВЕРОВ) ---
 async def get_download_url(url: str):
-    """
-    Отправляет ссылку на Cobalt API и получает прямую ссылку на видео-файл.
-    """
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
     body = {
         "url": url,
-        "vCodec": "h264" # Кодек, который понимает Телеграм
+        "vCodec": "h264"
     }
-    
-    # Публичный инстанс Cobalt. Если перестанет работать, нужно найти другой
-    # Список инстансов: https://instances.hyper.lol/
-    api_url = "https://co.wuk.sh/api/json" 
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(api_url, json=body, headers=headers) as response:
-                if response.status != 200:
-                    return None
-                data = await response.json()
-                
-                # Cobalt может вернуть разные статусы
-                if data.get('status') == 'stream':
-                    return data.get('url')
-                elif data.get('status') == 'redirect':
-                    return data.get('url')
-                elif data.get('status') == 'picker': # Если видео состоит из нескольких частей (редко)
-                    return data.get('picker')[0].get('url')
-                else:
-                    return None
-        except Exception as e:
-            print(f"API Error: {e}")
-            return None
 
-# --- ХЕНДЛЕРЫ БОТА ---
+    async with aiohttp.ClientSession() as session:
+        # Пробуем каждый сервер из списка
+        for api_url in COBALT_INSTANCES:
+            try:
+                print(f"Пробую сервер: {api_url}") # Пишем в логи Vercel
+                # Ставим таймаут 4 секунды, чтобы не висеть долго на одном сервере
+                async with session.post(api_url, json=body, headers=headers, timeout=4) as response:
+                    
+                    if response.status != 200:
+                        print(f"Сервер {api_url} вернул ошибку: {response.status}")
+                        continue # Идем к следующему серверу
+
+                    data = await response.json()
+                    
+                    # Логика обработки ответа Cobalt
+                    direct_link = None
+                    if data.get('status') == 'stream':
+                        direct_link = data.get('url')
+                    elif data.get('status') == 'redirect':
+                        direct_link = data.get('url')
+                    elif data.get('status') == 'picker':
+                        # Берем первое доступное видео
+                        direct_link = data.get('picker')[0].get('url')
+
+                    if direct_link:
+                        return direct_link # Успех! Возвращаем ссылку
+            
+            except Exception as e:
+                print(f"Ошибка соединения с {api_url}: {e}")
+                continue # Идем к следующему серверу
+                
+    return None # Если перебрали все и ничего не вышло
+
+# --- ХЕНДЛЕРЫ ---
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer(
-        "Привет! 👋\n"
-        "Я умею скачивать видео из TikTok, Instagram (Reels) и YouTube.\n"
-        "Просто пришли мне ссылку!"
-    )
+    await message.answer("Привет! Пришли мне ссылку на TikTok, Reels или YouTube.")
 
 @dp.message()
 async def download_handler(message: types.Message):
     text = message.text
     
-    # Простейшая проверка на ссылку
     if not text or "http" not in text:
-        await message.answer("Это не похоже на ссылку. Пришли мне URL видео.")
+        await message.answer("Это не ссылка.")
         return
 
-    # Отправляем сообщение "Ожидайте..."
-    status_msg = await message.answer("🔎 Ищу видео, подожди секунду...")
+    status_msg = await message.answer("🔎 Ищу рабочий сервер и качаю видео...")
     
     try:
-        # 1. Получаем прямую ссылку через API
         direct_url = await get_download_url(text)
         
         if direct_url:
-            # 2. Отправляем видео в Телеграм ПО ССЫЛКЕ
-            # (Телеграм сам скачивает его к себе на сервера и показывает пользователю)
             await message.answer_video(
                 video=direct_url,
                 caption="Готово! 📹",
@@ -88,13 +95,12 @@ async def download_handler(message: types.Message):
             )
             await status_msg.delete()
         else:
-            await status_msg.edit_text("😔 Не удалось получить видео. Возможно, ссылка закрытая или сервис перегружен.")
+            await status_msg.edit_text("😔 Все публичные серверы сейчас перегружены. Попробуй через минуту.")
             
     except Exception as e:
-        # Если ссылка битая или файл слишком большой для загрузки по URL
-        await status_msg.edit_text(f"Произошла ошибка при отправке: {e}")
+        await status_msg.edit_text(f"Ошибка Телеграм при отправке (возможно файл слишком большой): {e}")
 
-# --- WEBHOOK ЛОГИКА (ДЛЯ VERCEL) ---
+# --- WEBHOOK ---
 
 @app.post("/webhook")
 async def webhook_handler(request: Request):
@@ -104,9 +110,9 @@ async def webhook_handler(request: Request):
         await dp.feed_update(bot, update)
         return {"status": "ok"}
     except Exception as e:
-        print(f"Error handling update: {e}")
-        return {"status": "error"}
+        pass
+    return {"status": "error"}
 
 @app.get("/")
 async def index():
-    return {"message": "Bot is active! Don't forget to set webhook."}
+    return {"message": "Bot is running"}
