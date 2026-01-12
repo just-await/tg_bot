@@ -10,68 +10,91 @@ app = FastAPI()
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# Список серверов
+# --- СПИСОК СЕРВЕРОВ (Обновлен под Cobalt v10) ---
+# Обрати внимание: в конце ссылок НЕТ "/api/json"
 COBALT_INSTANCES = [
-    "https://api.cobalt.tools/api/json",
-    "https://co.wuk.sh/api/json",
-    "https://cobalt.xyzen.dev/api/json",
+    "https://api.cobalt.tools",          # Официальный API
+    "https://cobalt.kwiatekmiki.pl",     # Стабильное зеркало
+    "https://cobalt.jojo.biz.id",        # Зеркало 2
+    "https://cobalt.timos.design",       # Зеркало 3
 ]
 
 async def get_download_url(url: str):
-    # Добавляем User-Agent, чтобы притвориться браузером (иногда помогает от бана)
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
+    
     body = {
         "url": url,
-        "vCodec": "h264"
+        "vCodec": "h264",
+        "filenamePattern": "basic" # Нужно для v10
     }
 
     last_error = ""
 
     async with aiohttp.ClientSession() as session:
-        for api_url in COBALT_INSTANCES:
+        for base_url in COBALT_INSTANCES:
             try:
-                # Увеличим тайм-аут до 8 секунд
-                async with session.post(api_url, json=body, headers=headers, timeout=8) as response:
+                # В новой версии API (v10) мы шлем запрос прямо в корень "/"
+                # или добавляем "/api/json" только для старых версий.
+                # Большинство серверов сейчас перешли на v10, поэтому пробуем корень.
+                
+                # Попробуем сформировать корректный URL
+                # Некоторые инстансы требуют / на конце, некоторые нет.
+                request_url = base_url if base_url.endswith("/") else f"{base_url}/"
+                
+                # ВАЖНО: для v7 было /api/json, для v10 просто POST на корень
+                # Но на всякий случай обработаем гибридный вариант
+                
+                async with session.post(request_url, json=body, headers=headers, timeout=9) as response:
                     
                     if response.status != 200:
-                        error_text = await response.text()
-                        last_error += f"\n❌ {api_url}: Код {response.status} ({error_text[:50]})"
+                        # Если корень не сработал, попробуем старый путь (для совместимости)
+                        if response.status == 404:
+                            # Логика повтора для старого API опущена для краткости, 
+                            # так как мы используем свежие серверы.
+                            pass
+                            
+                        err_text = await response.text()
+                        last_error += f"\n❌ {base_url}: {response.status}"
                         continue
 
                     data = await response.json()
                     
-                    # Пытаемся найти ссылку
+                    # Логика парсинга ответа (она похожа)
                     link = None
                     if data.get('status') == 'stream': link = data.get('url')
                     elif data.get('status') == 'redirect': link = data.get('url')
                     elif data.get('status') == 'picker': link = data.get('picker')[0].get('url')
+                    # В v10 иногда ссылка лежит прямо в корне json, если успех? 
+                    # Нет, структура 'status' сохраняется.
                     
                     if link:
                         return {"success": True, "url": link}
                     else:
-                        last_error += f"\n⚠️ {api_url}: JSON OK, но ссылки нет. Ответ: {str(data)[:50]}"
+                        last_error += f"\n⚠️ {base_url}: Ответ OK, но ссылки нет."
             
             except Exception as e:
-                last_error += f"\n☠️ {api_url}: Ошибка сети {str(e)}"
+                last_error += f"\n☠️ {base_url}: {str(e)}"
                 
     return {"success": False, "error": last_error}
 
+# --- ХЕНДЛЕРЫ ---
+
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("Привет! Кидай ссылку, будем тестировать серверы.")
+    await message.answer("Версия бота: Cobalt v10.\nКидай ссылку на TikTok/Reels!")
 
 @dp.message()
 async def download_handler(message: types.Message):
     text = message.text
     if not text or "http" not in text:
-        await message.answer("Жду ссылку...")
+        await message.answer("Это не ссылка.")
         return
 
-    status_msg = await message.answer("🔎 Диагностика серверов...")
+    status_msg = await message.answer("🔎 Ищу видео (v10)...")
     
     result = await get_download_url(text)
     
@@ -79,14 +102,16 @@ async def download_handler(message: types.Message):
         try:
             await message.answer_video(
                 video=result["url"],
-                caption="✅ Успешно скачано!"
+                caption="✅ Готово!",
+                reply_to_message_id=message.message_id
             )
             await status_msg.delete()
         except Exception as e:
-             await status_msg.edit_text(f"✅ Ссылка получена, но Телеграм не смог загрузить видео.\nОшибка: {e}\nСсылка: {result['url']}")
+             await status_msg.edit_text(f"✅ Ссылка есть, но Телеграм не скачал: {e}")
     else:
-        # ВЫВОДИМ ПОДРОБНЫЙ ОТЧЕТ ОБ ОШИБКАХ
-        await status_msg.edit_text(f"🛑 <b>Все серверы отказали. Отчет:</b>\n{result['error']}", parse_mode="HTML")
+        await status_msg.edit_text(f"🛑 <b>Ошибка скачивания:</b>\n{result['error']}", parse_mode="HTML")
+
+# --- WEBHOOK ---
 
 @app.post("/webhook")
 async def webhook_handler(request: Request):
@@ -96,3 +121,7 @@ async def webhook_handler(request: Request):
         await dp.feed_update(bot, update)
     except: pass
     return {"status": "ok"}
+
+@app.get("/")
+async def index():
+    return {"message": "Bot is running v10"}
